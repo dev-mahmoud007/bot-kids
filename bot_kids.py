@@ -1,11 +1,12 @@
 import os
 import re
+import json
 import time
 import asyncio
 import logging
 import shutil
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -36,6 +37,8 @@ DELETE_TEXT_IF_NOT_REPLACED = False  # لو انحذف النص ولم يأتِ 
 MAX_HISTORY = 3000
 POLL_SECONDS = 20         # كل قديش يفحص القنوات مباشرة (شبكة أمان لو فاتت تحديثات حية)
 POLL_MIN_AGE = 8          # ما يلتقط رسالة إلا إذا مر عليها هالعدد من الثواني
+BACKFILL_DAYS = int(os.getenv("BACKFILL_DAYS", "21"))     # أول تشغيل بس: اسحب آخر كم يوم من المصدرين (0 = عطّل)
+BACKFILL_DELAY = float(os.getenv("BACKFILL_DELAY", "3"))  # ثواني راحة بين كل موديل وموديل أثناء التعبئة
 ON_REQUEST = "على الخاص"
 WA_LINK = os.getenv("WA_LINK", "https://wa.me/970592417956")
 BRAND = os.getenv("BRAND", "✨ فيرا كيدز | Vera Kids 🧸")
@@ -893,6 +896,149 @@ async def poller():
         await asyncio.sleep(POLL_SECONDS)
 
 
+# =====================  التعبئة الأولى (مرة وحدة)  =====================
+STATE_MARK = "KIDS_BACKFILL_STATE"
+
+
+async def load_state():
+    """حالة التعبئة محفوظة برسالة بالرسائل المحفوظة (Saved Messages)، فبتضل حتى لو ريلوي مسح الملفات."""
+    try:
+        msgs = await retry(client.get_messages, "me", search=STATE_MARK, limit=10)
+    except Exception:
+        log.exception("cannot read backfill state")
+        return None, None
+    for m in msgs:
+        t = m.raw_text or ""
+        if t.startswith(STATE_MARK):
+            try:
+                st = json.loads(t[len(STATE_MARK):].strip())
+            except Exception:
+                continue
+            if st.get("target") == TARGET_CHANNEL:
+                return m, st
+    return None, None
+
+
+async def save_state(msg, st):
+    if DRY_RUN:
+        return msg
+    text = STATE_MARK + "\n" + json.dumps(st, ensure_ascii=False)
+    try:
+        if msg is None:
+            return await retry(client.send_message, "me", text)
+        await retry(client.edit_message, "me", msg.id, text)
+    except Exception:
+        log.exception("save_state failed")
+    return msg
+
+
+def group_history(src, msgs):
+    """يحوّل رسائل قديمة (من الأقدم للأحدث) لموديلات: وسائط ثم نصها. وسائط بدون نص بتنتجاهل."""
+    out, cur = [], None
+
+    def finish(c):
+        if c and c["media"] and c["text"]:
+            p = Post(src)
+            p.media = list(c["media"])
+            p.media_ids = {m.id for m in p.media}
+            p.text, p.text_id = c["text"], c["text_id"]
+            out.append((c["last_date"], p))
+
+    for m in msgs:
+        text = m.raw_text or ""
+        if is_media(m):
+            same_album = bool(cur and m.grouped_id and m.grouped_id == cur["group"])
+            if cur and cur["text"] and not same_album:
+                finish(cur)
+                cur = None
+            if cur and not cur["text"] and not same_album and (m.date - cur["last_date"]).total_seconds() > MERGE_WINDOW:
+                cur = None                      # وسائط يتيمة بدون نص
+            if cur is None:
+                cur = {"media": [], "text": None, "text_id": None, "group": None, "last_date": m.date}
+            cur["media"].append(m)
+            cur["group"] = m.grouped_id
+            cur["last_date"] = m.date
+            if text.strip():
+                cur["text"], cur["text_id"] = text, m.id
+        elif text.strip():
+            if cur and cur["media"] and not cur["text"]:
+                cur["text"], cur["text_id"], cur["last_date"] = text, m.id, m.date
+                finish(cur)
+                cur = None
+            elif cur:
+                finish(cur)                     # نص لحاله: ما بنعبّيه بالتعبئة
+                cur = None
+    finish(cur)
+    return out
+
+
+async def maybe_backfill():
+    """بينشر آخر BACKFILL_DAYS يوم من المصدرين مرة وحدة بس، وبيكمّل من وين وقف لو انقطع."""
+    if BACKFILL_DAYS <= 0:
+        return False
+    smsg, st = await load_state()
+    if st and st.get("done"):
+        log.info("BACKFILL already done → live only")
+        return False
+    if st is None:
+        st = {"v": 1, "target": TARGET_CHANNEL, "done": False, "days": BACKFILL_DAYS,
+              "cutoff": (datetime.now(timezone.utc) - timedelta(days=BACKFILL_DAYS)).timestamp(),
+              "baseline": {n: ch.baseline for n, ch in channels.items()}, "last": {}}
+        smsg = await save_state(None, st)
+        await notify(f"📥 بدأت التعبئة الأولى (آخر {BACKFILL_DAYS} يوم). لا تعمل Deploy جديد أثناءها إلا للضرورة.")
+    else:
+        for n, ch in channels.items():
+            if n in st.get("baseline", {}):
+                ch.baseline = st["baseline"][n]
+        await notify("📥 كمّلت التعبئة الأولى من وين وقفت")
+    cutoff = datetime.fromtimestamp(st["cutoff"], tz=timezone.utc)
+
+    plan = []
+    for src, ch in channels.items():
+        last = st["last"].get(src, 0)
+        base = st["baseline"].get(src, ch.baseline)
+        msgs = []
+        async for m in client.iter_messages(entities[src], offset_date=cutoff, reverse=True):
+            if m.id > base:
+                break
+            if m.id <= last:
+                continue
+            msgs.append(m)
+        found = group_history(src, msgs)
+        log.info("BACKFILL [%s] %d messages → %d models", src, len(msgs), len(found))
+        plan += found
+    plan.sort(key=lambda x: x[0])
+
+    for n, (_, p) in enumerate(plan, 1):
+        register(p)
+        await queue.put(p)
+        await queue.join()
+        if not (p.sent_media or p.sent_text or DRY_RUN):
+            log.warning("BACKFILL post %d/%d seems not sent [%s]", n, len(plan), p.source)
+        ids = [m.id for m in p.media] + ([p.text_id] if p.text_id else [])
+        st["last"][p.source] = max(st["last"].get(p.source, 0), max(ids))
+        smsg = await save_state(smsg, st)
+        if n % 10 == 0:
+            log.info("BACKFILL progress %d/%d", n, len(plan))
+        await asyncio.sleep(BACKFILL_DELAY)
+
+    st["done"] = True
+    await save_state(smsg, st)
+    await notify(f"✅ انتهت التعبئة الأولى: {len(plan)} موديل. من هلأ البوت شغال لايف.")
+    return True
+
+
+async def catch_up():
+    """بعد التعبئة: أي رسائل نزلت بالمصدرين أثناءها (أحدث من نقطة البداية)."""
+    for src, ch in channels.items():
+        try:
+            msgs = await retry(client.get_messages, entities[src], min_id=ch.baseline, limit=300)
+            for m in sorted(msgs, key=lambda x: x.id):
+                await process_new(src, m)
+        except Exception:
+            log.exception("catch_up failed for %s", src)
+
+
 # =====================  التشغيل  =====================
 async def main():
     global target, queue
@@ -911,13 +1057,17 @@ async def main():
         except Exception:
             log.exception("cannot resolve source %s", name)
 
+    spawn(sender())
+    backfilled = await maybe_backfill()      # مرة وحدة بس (الحالة محفوظة بالرسائل المحفوظة)
+
     chats = list(id_to_name)
     client.add_event_handler(on_new, events.NewMessage(chats=chats))
     client.add_event_handler(on_edit, events.MessageEdited(chats=chats))
     client.add_event_handler(on_delete, events.MessageDeleted())
 
-    spawn(sender())
     spawn(poller())
+    if backfilled:
+        await catch_up()
     log.info("🔥 KIDS BOT STARTED [%s] — target=%s — watching: %s", "DRY_RUN" if DRY_RUN else "LIVE", TARGET_CHANNEL, ", ".join(id_to_name.values()))
     await client.run_until_disconnected()
 
