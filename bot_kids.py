@@ -120,11 +120,18 @@ FABRICS = {
 QUALITY = {1: "درجة أولى", 2: "درجة ثانية", 3: "درجة ثالثة"}
 
 # ---- السعر ----
-NUM = r"\d+(?:[.,]\d+)?"
-P_PIECE = re.compile(rf"(?:سعر[ \t]*القطع[هة]|price[ \t]*per[ \t]*piece|piece[ \t]*price|adet[ \t]*fiyat\w*)[ \t]*[:\-–=]*[ \t]*\$?[ \t]*({NUM})")
-P_KEY = re.compile(rf"(?:wholesale(?:\s*price)?|toptan(?:\s*fiyat\w*)?|fiyat\w*|price|السعر|سعر)\s*[:\-–=]*\s*\$?\s*({NUM})")
+NUM = r"\d+(?:[.,،٫]\d+)?"
+P_PIECE = re.compile(rf"(?:سعر[ \t]*القطع[هة]|price[ \t]*per[ \t]*piece|piece[ \t]*price|adet[ \t]*fiyat\w*)[^\w\n]*({NUM})")
+P_KEY = re.compile(rf"(?:wholesale(?:\s*price)?|toptan(?:\s*fiyat\w*)?|fiyat\w*|price|السعر|سعر)[^\w]*({NUM})")
 P_CUR = re.compile(rf"({NUM})\s*(?:\$|دولار|دولارات|usd|dollars?)")
 P_DOL = re.compile(rf"\$\s*({NUM})")
+
+
+def parse_num(s):
+    """6،75 / 6,75 / 6.75 كلها 6.75؛ و1,200 (3 خانات بعد الفاصلة) = ألف ومئتين."""
+    if re.fullmatch(r"\d{1,3}[,،٫]\d{3}", s):
+        return float(re.sub(r"[,،٫]", "", s))
+    return float(re.sub(r"[,،٫]", ".", s))
 
 
 def find_price(f):
@@ -132,15 +139,16 @@ def find_price(f):
     for pat, per in ((P_PIECE, True), (P_KEY, False), (P_CUR, False), (P_DOL, False)):
         m = pat.search(f)
         if m:
-            return float(m.group(1).replace(",", ".")), m.span(1), per
+            return parse_num(m.group(1)), m.span(1), per
     return None, None, False
 
 
 # ---- باقي الحقول ----
-SERIES_RE = re.compile(r"(?:^|[^\w])(?:(?:ال)?سيري|series|seri|siri|pk|pack|paket)\s*[:\-–.]*\s*(\d+)\s*(?:قطع[هة]?|pcs?|pieces?|adet|parca)?")
+SERIES_RE = re.compile(r"(?:^|[^\w])(?:(?:ال)?سيري|series|seri|siri|pk|pack|paket)\s*[:\-–.]*\s*(\d+)\s*(?:قطع[هة]?|عدد|حبه|حبات|pcs?|pieces?|adet|parca)?")
 PIECES_RE = re.compile(r"(\d+)\s*(?:pieces?|pcs|pc|parca|قطع[هة]?)\b")
 CODE_RE = re.compile(r"\b(?:cod|kod|code|كود|الكود)\b\s*[:\-–.]*\s*([a-z]*\d[\w\-]*)")
-AGE_KEY = re.compile(r"\b(?:sizes?|age|ages|yas|beden|olcu)\b|مقاس|عمر|اعمار|سنوات|سنه")
+AGE_KEY = re.compile(r"\b(?:sizes?|age|ages|yas|beden|olcu|months?)\b|مقاس|عمر|اعمار|سنوات|سنه|شهر|اشهر|شهور")
+CHAIN_RE = re.compile(r"(?<!\d)\d{1,2}(?:\s*[-–]\s*\d{1,2}){2,}(?!\d)")
 PAIR_RE = re.compile(r"(?<!\d)(\d{1,2})\s*[.\-–_]\s*(\d{1,2})(?!\d)")
 LETTER_SIZES = re.compile(r"\b(?:xxs|xs|s|m|l|xl|xxl|xxxl|2xl|3xl|4xl)\b")
 COLOR_KEY = re.compile(r"colou?rs?\b|renkler\b|renk\b|الوان|لون")
@@ -153,14 +161,19 @@ def parse_ages(flines):
         seg = f
         if not re.search(r"\d", seg) and i + 1 < len(flines):
             seg = flines[i + 1]                       # الأعمار بالسطر اللي بعد الكلمة
+        unit = "شهر" if re.search(r"شهر|اشهر|شهور|\bmonths?\b", f + " " + seg) else "سنوات"
+        chain = CHAIN_RE.search(seg)
+        if chain:                                     # 06-09-12-18 = قائمة أرقام مش أزواج
+            nums = [str(int(x)) for x in re.findall(r"\d+", chain.group(0))]
+            return "الأعمار", " | ".join(nums) + f" {unit}"
         pairs = PAIR_RE.findall(seg)
         if pairs:
-            return "الأعمار", " | ".join(f"{a}-{b}" for a, b in pairs) + " سنوات"
+            return "الأعمار", " | ".join(f"{a}-{b}" for a, b in pairs) + f" {unit}"
         nums = re.findall(r"\d+", seg)
         if len(nums) == 2 and "/" in seg:
-            return "الأعمار", f"{nums[0]}-{nums[1]} سنوات"
+            return "الأعمار", f"{nums[0]}-{nums[1]} {unit}"
         if nums:
-            return "الأعمار", " | ".join(nums) + " سنوات"
+            return "الأعمار", " | ".join(nums) + f" {unit}"
         letters = LETTER_SIZES.findall(seg)
         if letters:
             return "المقاسات", " - ".join(x.upper() for x in letters)
@@ -328,11 +341,16 @@ def parse_kids(text, markup):
         gender = "بناتي"
 
     # العنوان
-    title = " – ".join(parse_tags(ft))
+    tags = parse_tags(ft)
+    oversize = bool(re.search(r"over\s*-?\s*size|اوفر\s*سايز", ft))
+    if tags and oversize:
+        tags.append("أوفرسايز")
+    title = " – ".join(tags)
     gender_used = False
     if not title:
-        if re.search(r"\btakim\b|\bset\b|طقم", ft):
-            title = f"طقم {gender}".strip()
+        has_set = bool(re.search(r"\btakim\b|\bset\b|طقم", ft))
+        if has_set or oversize:
+            title = " ".join(x for x in ("طقم" if has_set else "", "أوفرسايز" if oversize else "", gender) if x)
             gender_used = bool(gender)
         else:
             for l in lines:
